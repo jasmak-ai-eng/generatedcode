@@ -1,149 +1,240 @@
-# Code Review Report - TMF622 Product Ordering Management
+# Code Review Report - TMF622 Product Ordering Management API
 
-**Generated:** 2025-01-17  
-**Application:** TMF622 - Product Ordering Management  
-**Source YAML:** TMF622-ProductOrdering-v5.0.0.oas.yaml  
-**Reference Pattern:** TMF632 Individual Service (rules.md)
+**Generated**: 2025-01-20
+**Source YAML**: TMF622-ProductOrdering-v5.0.0.oas.yaml
+**Generated Files**:
+- services/tmf622/productOrder.service.js
+- services/tmf622/tmf622-event-publisher.service.js
 
 ---
 
 ## Executive Summary
 
-Code review completed for 3 generated service files implementing TMF622 Product Ordering Management API. The generated code follows the reference patterns from rules.md with the following findings:
+This report identifies issues found in the generated TMF622 Product Ordering Management API service implementation when compared against the reference code patterns from TMF632 Individual API Service.
 
-| Category | Issues Found |
-|----------|-------------|
-| Critical | 0 |
-| High | 2 |
-| Medium | 4 |
-| Low | 3 |
+---
+
+## Issues Found
+
+### 1. Missing CancelProductOrder Service
+
+**File**: N/A
+**Severity**: HIGH
+**Category**: Code Completeness
+
+The TMF622 OpenAPI specification defines two main resources:
+- ProductOrder (implemented)
+- CancelProductOrder (NOT implemented)
+
+The CancelProductOrder resource is a task-based resource used to request order cancellation and should have its own service file with full CRUD operations.
+
+---
+
+### 2. Missing Date Format Validation Pattern
+
+**File**: productOrder.service.js
+**Location**: create/patch params
+**Severity**: MEDIUM
+**Category**: Input Validation
+
+The reference code includes regex pattern validation for date fields:
+```javascript
+birthDate: {
+    type: "string",
+    optional: true,
+    pattern: /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}:\d{2}(\.\d{3})?Z?)?$/,
+    messages: {
+        stringPattern: "The 'birthDate' field must be a valid ISO 8601 date..."
+    }
+}
+```
+
+The generated code has date fields without validation patterns:
+- requestedCompletionDate
+- requestedStartDate
+- cancellationDate
+- expectedCompletionDate
+- completionDate
+
+---
+
+### 3. Incomplete Search Conditions Implementation
+
+**File**: productOrder.service.js
+**Location**: buildSearchConditions method
+**Severity**: MEDIUM
+**Category**: Feature Completeness
+
+The reference code implements a two-tier search strategy that includes searching in related entity tables:
+```javascript
+// Search contact medium (email, phone) - two-step query approach
+const matchingContacts = await ctx.call("v1.db.contact_medium.find", {...});
+```
+
+The generated code only searches main entity fields and does not implement related entity search (e.g., searching by relatedParty name, note content, etc.).
+
+---
+
+### 4. Missing ProductOrderItem Nested Entity Management
+
+**File**: productOrder.service.js
+**Location**: createProductOrderItem method
+**Severity**: MEDIUM
+**Category**: Data Model
+
+ProductOrderItem is a complex nested structure containing its own related entities:
+- product
+- productOffering
+- itemPrice
+- itemTerm
+- productOrderItemRelationship
+- etc.
+
+The current implementation stores the entire ProductOrderItem as a flat structure but doesn't handle nested relationships within ProductOrderItem properly.
+
+---
+
+### 5. State Field Naming Inconsistency
+
+**File**: productOrder.service.js
+**Location**: Multiple locations
+**Severity**: LOW
+**Category**: Consistency
+
+The reference code uses `status` field for state tracking:
+```javascript
+const oldStatus = existing.status;
+if (fieldName === "status") { statusChanged = true; }
+```
+
+The generated code correctly uses `state` for ProductOrder (per TMF622 spec), but the variable naming `statusChanged` may cause confusion. The variable should be named `stateChanged` for consistency.
+
+---
+
+### 6. Missing ProductOrderStateType Enum Validation
+
+**File**: productOrder.service.js
+**Location**: create/patch params
+**Severity**: LOW
+**Category**: Input Validation
+
+The TMF622 specification defines valid ProductOrderStateType values:
+- acknowledged
+- rejected
+- pending
+- held
+- inProgress
+- cancelled
+- completed
+- failed
+- partial
+- assessingCancellation
+- pendingCancellation
+- draft
+- inProgress.accepted
+
+The generated code does not validate that the `state` field contains only valid enum values.
+
+---
+
+### 7. Missing billingAccount Null Cleanup in populateProductOrder
+
+**File**: productOrder.service.js
+**Location**: populateProductOrder method
+**Severity**: LOW
+**Category**: Data Handling
+
+When billingAccount is parsed from JSON string, the resulting object is not passed through removeNullFields for cleanup:
+```javascript
+if (populated.billingAccount && typeof populated.billingAccount === 'string') {
+    try {
+        populated.billingAccount = JSON.parse(populated.billingAccount);
+    } catch (e) {
+        // Keep as is if not valid JSON
+    }
+}
+```
+
+Should include: `populated.billingAccount = this.removeNullFields(populated.billingAccount);`
+
+---
+
+### 8. Missing Header Comments for Complex Methods
+
+**File**: productOrder.service.js
+**Location**: applyAddOperation, applyRemoveOperation, applyReplaceOperation
+**Severity**: LOW
+**Category**: Code Documentation
+
+The reference code includes detailed JSDoc-style comments explaining the purpose, pattern, and behavior of complex methods. The generated code has shorter comments that don't fully document:
+- Two scenarios for ADD (no filter vs with filter)
+- Two scenarios for REMOVE (entire element vs specific field)
+- Merge behavior for REPLACE operations
+
+---
+
+### 9. Inconsistent Error Code Handling
+
+**File**: productOrder.service.js
+**Location**: Multiple error throws
+**Severity**: LOW
+**Category**: Error Handling
+
+The reference code creates Error objects with explicit code property:
+```javascript
+const error = new Error("...");
+error.code = 412;
+error.type = "PRECONDITION_FAILED";
+throw error;
+```
+
+Some generated error throws use `new Error(message, code)` syntax which is not standard:
+```javascript
+throw new Error("ID is required", 400);
+```
+
+This may not set the error code correctly in all JavaScript environments.
+
+---
+
+### 10. Missing Related Entity Deep Search in List Action
+
+**File**: productOrder.service.js
+**Location**: list action handler
+**Severity**: MEDIUM
+**Category**: Feature Completeness
+
+The reference implementation includes searching across related entity fields (contact medium email/phone). The generated code should implement similar deep search for:
+- relatedParty names
+- note content/author
+- channel names
+- externalId identifiers
+
+---
+
+## Summary Statistics
+
+| Severity | Count |
+|----------|-------|
+| HIGH     | 1     |
+| MEDIUM   | 4     |
+| LOW      | 5     |
+| **Total**| **10**|
 
 ---
 
 ## Files Reviewed
 
-1. `services/tmf622/productOrder.service.js`
-2. `services/tmf622/cancelProductOrder.service.js`
-3. `services/tmf622/tmf622-event-publisher.service.js`
+1. **services/tmf622/productOrder.service.js**
+   - Lines: ~980
+   - Actions: list, create, get, patch, remove
+   - Methods: 25+
+
+2. **services/tmf622/tmf622-event-publisher.service.js**
+   - Lines: ~85
+   - Actions: publish
+   - Follows reference pattern correctly
 
 ---
 
-## Detailed Findings
-
-### productOrder.service.js
-
-#### HIGH-001: Missing Nested JSON Path Parsing Methods
-**Location:** methods section  
-**Issue:** The `parseJsonPath` method does not include all the complex JSON path parsing patterns found in the reference code (nested attribute regex, complex filter regex, multi-condition regex, dot notation format, filter selector format).
-
-#### HIGH-002: Missing `deleteNestedValue` Helper Method
-**Location:** methods section  
-**Issue:** The reference code includes a `deleteNestedValue` method for handling nested attribute deletions during remove operations. This method is missing from the generated code.
-
-#### MEDIUM-001: Incomplete Nested Attribute Handling in Patch Operations
-**Location:** `handleAddOperation`, `handleRemoveOperation`, `handleReplaceOperation` methods  
-**Issue:** The reference code has more comprehensive nested attribute handling using `setNestedValue` for nested paths like "partyOrPartyRole.name". The generated code has simplified implementations.
-
-#### MEDIUM-002: Missing `billingAccount` Related Entity Handling
-**Location:** create action, related entities processing  
-**Issue:** The `billingAccount` field is defined in params but is not extracted and handled as a related entity in the create process. It should be stored as a reference similar to other related entities.
-
-#### MEDIUM-003: Simplified Error Event Structure
-**Location:** patch action, remove action  
-**Issue:** The delete event payload only includes minimal fields (id, href, @type). The reference code includes a `name` field in the delete event which may be useful for downstream consumers.
-
-#### LOW-001: Missing TMF630 Comment Documentation
-**Location:** patch action  
-**Issue:** The reference code includes comprehensive JSDoc comments explaining the JSON Patch Query format (TMF630 Part 5 compliance) with examples. The generated code has minimal comments.
-
-#### LOW-002: Missing `parseMultipleConditions` Method
-**Location:** methods section  
-**Issue:** The reference code includes a `parseMultipleConditions` method for handling complex JSON Path expressions with multiple conditions (e.g., "@.field1=='value1' && @.field2=='value2'"). This is not present in the generated code.
-
----
-
-### cancelProductOrder.service.js
-
-#### MEDIUM-004: No Patch Operation Support
-**Location:** actions section  
-**Issue:** The CancelProductOrder resource in TMF622 does not have a patch operation defined, which aligns with the YAML spec. However, the reference TMF632 pattern includes patch operations for all resources. Verify if this is intentional based on TMF622 spec.
-
-#### LOW-003: Missing State Change Event
-**Location:** service actions  
-**Issue:** The CancelProductOrder resource can have state changes (acknowledged -> inProgress -> done), but there is no state change event publishing when state changes occur. Only the create event is published.
-
----
-
-### tmf622-event-publisher.service.js
-
-**No issues identified.** The event publisher service correctly follows the reference pattern from tmf632-event-publisher.service.js.
-
----
-
-## Pattern Compliance Assessment
-
-| Pattern Element | Compliance | Notes |
-|----------------|------------|-------|
-| Service Structure | ✅ Compliant | Module exports, settings, dependencies, actions, methods, started() |
-| Action Definitions | ✅ Compliant | scope, rest, cache, params, handler structure |
-| Database Service Calls | ✅ Compliant | v1.db.{entity}.{operation} pattern |
-| Error Handling | ⚠️ Partial | Basic validation present, missing some edge cases |
-| Event Publishing | ✅ Compliant | Event publisher integration correct |
-| ID Generation | ✅ Compliant | Using cuid() for ID generation |
-| Null Handling | ✅ Compliant | Converting null to "null" string |
-| Field Filtering | ✅ Compliant | filterFields, mapToSchema patterns |
-| Pagination | ✅ Compliant | offset, limit, meta response |
-| Search | ✅ Compliant | search, searchFields with regex |
-
----
-
-## Schema Compliance
-
-### ProductOrder Schema Fields
-- ✅ Core fields: id, href, category, description, priority, state
-- ✅ Date fields: requestedCompletionDate, requestedStartDate, expectedCompletionDate, completionDate, creationDate, cancellationDate
-- ✅ Array fields: productOrderItem, note, channel, relatedParty, agreement, payment, etc.
-- ⚠️ billingAccount: Defined but not fully implemented as related entity
-
-### CancelProductOrder Schema Fields
-- ✅ Core fields: id, href, cancellationReason, state
-- ✅ Date fields: creationDate, requestedCancellationDate, effectiveCancellationDate
-- ✅ Reference: productOrder reference handling
-
----
-
-## Security Observations
-
-| Check | Status |
-|-------|--------|
-| Client ID Isolation | ✅ All queries include clientId |
-| Input Validation | ✅ Param validation via Moleculer |
-| ID Validation | ✅ Empty ID checks in handlers |
-| Non-Patchable Fields | ✅ Protected (id, href, @type, creationDate) |
-
----
-
-## Performance Observations
-
-| Aspect | Status | Notes |
-|--------|--------|-------|
-| Parallel Population | ✅ Using Promise.all for related entity fetching |
-| Cache Disabled | ⚠️ All actions have cache: false |
-| Sequential DB Updates | ⚠️ Related entity updates are sequential in create |
-
----
-
-## Summary
-
-The generated code provides a functional implementation of TMF622 Product Ordering Management API that follows the reference patterns from rules.md. The identified issues are primarily related to:
-
-1. **Incomplete advanced JSON patch features** - Some complex JSON path parsing capabilities from the reference are missing
-2. **Minor missing helper methods** - deleteNestedValue and parseMultipleConditions
-3. **Documentation gaps** - Less comprehensive comments compared to reference
-4. **Edge case handling** - Some scenarios may need additional handling
-
-The code is production-ready for basic operations but may require enhancements for full TMF630 Part 5 compliance with complex patch operations.
-
----
-
-*Report generated by automated code review pipeline*
+*This review report was automatically generated by the AI Code Review Pipeline.*
