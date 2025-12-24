@@ -1,1101 +1,1043 @@
 "use strict";
 
-const cuid = require('cuid');
+/**
+ * ============================================================================
+ * TMF663 Shopping Cart API Service - Generated Implementation
+ * ============================================================================
+ *
+ * This file implements the TMF663 Shopping Cart Management API
+ * Generated following the reference patterns from TMF632 Individual service.
+ *
+ * KEY ARCHITECTURE PATTERNS:
+ *
+ * 1. DUAL PATCH STRATEGY (TMF630 Compliant):
+ *    - JSON Patch Query (TMF630): Array of operations with op/path/value
+ *    - Legacy Merge: Object-based merge (backward compatible)
+ *
+ * 2. RELATED ENTITY MANAGEMENT:
+ *    - Main entity stores arrays of IDs for related entities
+ *    - Related entities are stored in separate database tables
+ *    - Related entities are populated on GET/LIST operations
+ *
+ * 3. MULTI-TENANCY:
+ *    - All entities are scoped by clientId
+ *
+ * 4. NULL VALUE HANDLING:
+ *    - Database stores "null" string instead of null
+ *    - All null values are cleaned recursively before returning responses
+ *
+ * 5. OPTIMISTIC LOCKING:
+ *    - Uses ETag header with updatedAt/createdAt timestamp
+ *
+ * 6. EVENT PUBLISHING:
+ *    - All state changes publish TMF events
+ */
+
+const cuid = require("cuid");
+const JsonPatchQueryHelper = require("../../helpers/jsonPatchQuery");
 
 module.exports = {
-  name: "tmf663.shoppingCart",
-  version: 1,
-
-  settings: {
-    defaultPageSize: 20,
-    maxPageSize: 100,
-    baseUrl: process.env.API_BASE_URL || "http://localhost:3000"
-  },
-
-  dependencies: [],
-
-  actions: {
-    list: {
-      scope: ["shoppingCart.list"],
-      rest: {
-        method: "GET",
-        path: "/list"
-      },
-      cache: false,
-      params: {
-        fields: { type: "string", optional: true },
-        offset: { type: "number", integer: true, min: 0, default: 0, optional: true, convert: true },
-        limit: { type: "number", integer: true, min: 1, max: 100, default: 20, optional: true, convert: true },
-        search: { type: "string", optional: true },
-        searchFields: { type: "string", optional: true }
-      },
-      async handler(ctx) {
-        const { fields, offset, limit, search, searchFields, ...filters } = ctx.params;
-        const clientId = ctx.meta.clientId;
-
-        if (search && !searchFields) {
-          throw new Error("searchFields parameter is required when search parameter is provided", 400);
-        }
-        if (searchFields && !search) {
-          throw new Error("search parameter is required when searchFields parameter is provided", 400);
-        }
-
-        const query = { clientId };
-        Object.keys(filters).forEach(key => {
-          if (filters[key] !== undefined) query[key] = filters[key];
-        });
-
-        if (search && searchFields) {
-          const searchFieldList = searchFields.split(",").map(f => f.trim());
-          const searchConditions = searchFieldList.map(field => ({
-            [field]: { $regex: search, $options: "i" }
-          }));
-          query.$or = searchConditions;
-        }
-
-        const entities = await ctx.call("v1.db.shopping_cart.find", {
-          query,
-          offset,
-          limit,
-          sort: "-createdAt"
-        });
-
-        const populated = await Promise.all(
-          entities.map(entity => this.populateShoppingCart(ctx, entity))
-        );
-
-        const total = await ctx.call("v1.db.shopping_cart.count", { query });
-
-        let results = populated.map(entity => this.mapToSchema(entity));
-
-        if (fields) {
-          const fieldList = fields.split(",").map(f => f.trim());
-          results = results.map(entity => this.filterFields(entity, fieldList));
-        }
-
-        return {
-          data: results,
-          meta: { total, offset, limit, hasMore: offset + limit < total }
-        };
-      }
-    },
-
-    create: {
-      scope: ["shoppingCart.create"],
-      rest: {
-        method: "POST",
-        path: "/create"
-      },
-      cache: false,
-      params: {
-        "@type": { type: "string", optional: true, default: "ShoppingCart" },
-        "@baseType": { type: "string", optional: true },
-        "@schemaLocation": { type: "string", optional: true },
-        validFor: { type: "object", optional: true },
-        contactMedium: { type: "array", optional: true },
-        cartTotalPrice: { type: "array", optional: true },
-        cartItem: { type: "array", optional: true },
-        relatedParty: { type: "array", optional: true }
-      },
-      async handler(ctx) {
-        const entityData = { ...ctx.params };
-        const clientId = ctx.meta.clientId;
-
-        const id = cuid();
-        entityData.id = id;
-        entityData.clientId = clientId;
-        entityData.creationDate = new Date().toISOString();
-        entityData.lastUpdate = new Date().toISOString();
-
-        if (!entityData["@type"]) entityData["@type"] = "ShoppingCart";
-
-        Object.keys(entityData).forEach(key => {
-          if (entityData[key] === null) {
-            entityData[key] = "null";
-          }
-        });
-
-        const relatedEntities = {
-          contactMedium: entityData.contactMedium,
-          cartTotalPrice: entityData.cartTotalPrice,
-          cartItem: entityData.cartItem,
-          relatedParty: entityData.relatedParty
-        };
-
-        delete entityData.contactMedium;
-        delete entityData.cartTotalPrice;
-        delete entityData.cartItem;
-        delete entityData.relatedParty;
-
-        const created = await ctx.call("v1.db.shopping_cart.create", entityData);
-        const entityId = created.id;
-
-        created.href = `${this.settings.baseUrl}/api/v1/tmf663/shoppingCart/get/${entityId}`;
-        await ctx.call("v1.db.shopping_cart.update", {
-          id: entityId,
-          clientId,
-          href: created.href
-        });
-
-        try {
-          if (relatedEntities.contactMedium && relatedEntities.contactMedium.length > 0) {
-            const ids = await this.createContactMedium(ctx, relatedEntities.contactMedium, entityId, clientId);
-            created.contactMedium = ids;
-            await ctx.call("v1.db.shopping_cart.update", { id: entityId, clientId, contactMedium: ids });
-          }
-
-          if (relatedEntities.cartTotalPrice && relatedEntities.cartTotalPrice.length > 0) {
-            const ids = await this.createCartTotalPrice(ctx, relatedEntities.cartTotalPrice, entityId, clientId);
-            created.cartTotalPrice = ids;
-            await ctx.call("v1.db.shopping_cart.update", { id: entityId, clientId, cartTotalPrice: ids });
-          }
-
-          if (relatedEntities.cartItem && relatedEntities.cartItem.length > 0) {
-            const ids = await this.createCartItem(ctx, relatedEntities.cartItem, entityId, clientId);
-            created.cartItem = ids;
-            await ctx.call("v1.db.shopping_cart.update", { id: entityId, clientId, cartItem: ids });
-          }
-
-          if (relatedEntities.relatedParty && relatedEntities.relatedParty.length > 0) {
-            const ids = await this.createRelatedParty(ctx, relatedEntities.relatedParty, entityId, clientId);
-            created.relatedParty = ids;
-            await ctx.call("v1.db.shopping_cart.update", { id: entityId, clientId, relatedParty: ids });
-          }
-
-          const updatedEntity = await ctx.call("v1.db.shopping_cart.get", { id: entityId, clientId });
-          const populated = await this.populateShoppingCart(ctx, updatedEntity);
-          const schemaFiltered = this.mapToSchema(populated);
-
-          await ctx.call("v1.tmf663.event-publisher.publish", {
-            eventType: "ShoppingCartCreateEvent",
-            event: {
-              eventType: "ShoppingCartCreateEvent",
-              eventTime: new Date().toISOString(),
-              event: { shoppingCart: schemaFiltered }
-            }
-          });
-
-          return schemaFiltered;
-
-        } catch (error) {
-          await ctx.call("v1.db.shopping_cart.remove", { id: entityId, clientId });
-          throw error;
-        }
-      }
-    },
-
-    get: {
-      scope: ["shoppingCart.get"],
-      rest: {
-        method: "GET",
-        path: "/get/:id"
-      },
-      cache: false,
-      params: {
-        id: { type: "string" },
-        fields: { type: "string", optional: true }
-      },
-      async handler(ctx) {
-        const { id, fields } = ctx.params;
-        const clientId = ctx.meta.clientId;
-
-        if (!id || id.trim() === "") {
-          throw new Error("ID is required", 400);
-        }
-
-        const entity = await ctx.call("v1.db.shopping_cart.get", { id, clientId });
-        if (!entity) {
-          throw new Error(`ShoppingCart with id ${id} not found`, 404);
-        }
-
-        const populated = await this.populateShoppingCart(ctx, entity);
-        let result = this.mapToSchema(populated);
-
-        if (fields) {
-          const fieldList = fields.split(",").map(f => f.trim());
-          result = this.filterFields(result, fieldList);
-        }
-
-        return result;
-      }
-    },
-
-    patch: {
-      scope: ["shoppingCart.patch"],
-      rest: {
-        method: "PATCH",
-        path: "/patch/:id"
-      },
-      cache: false,
-      params: {
-        id: { type: "string" }
-      },
-      async handler(ctx) {
-        const { id } = ctx.params;
-        const clientId = ctx.meta.clientId;
-
-        if (!id || id.trim() === "") {
-          throw new Error("ID is required", 400);
-        }
-
-        const existing = await ctx.call("v1.db.shopping_cart.get", { id, clientId });
-        if (!existing) {
-          throw new Error(`ShoppingCart with id ${id} not found`, 404);
-        }
-
-        const populatedExisting = await this.populateShoppingCart(ctx, existing);
-
-        const body = ctx.params;
-        const patchOperations = body.operations || body.patchOperations;
-        
-        let changedAttributes = [];
-        let updatedResource;
-
-        if (Array.isArray(patchOperations)) {
-          updatedResource = await this.applyJsonPatchQuery(ctx, populatedExisting, patchOperations, clientId);
-          changedAttributes = this.extractChangedAttributesFromOperations(patchOperations);
-        } else {
-          const { id: _id, operations, patchOperations: _patchOps, ...updates } = body;
-          
-          if (Object.keys(updates).length === 0) {
-            throw new Error("No update data provided. Use 'operations' array for JSON Patch Query or provide fields directly for merge patch.", 400);
-          }
-          
-          updatedResource = await this.applyMergePatch(ctx, existing, updates, clientId);
-          changedAttributes = Object.keys(updates);
-        }
-
-        const finalEntity = await ctx.call("v1.db.shopping_cart.get", { id, clientId });
-        const populated = await this.populateShoppingCart(ctx, finalEntity);
-        const schemaFiltered = this.mapToSchema(populated);
-
-        const eventType = "ShoppingCartAttributeValueChangeEvent";
-
-        await ctx.call("v1.tmf663.event-publisher.publish", {
-          eventType,
-          event: {
-            eventType,
-            eventTime: new Date().toISOString(),
-            event: { shoppingCart: schemaFiltered, changedAttributes }
-          }
-        });
-
-        return schemaFiltered;
-      }
-    },
-
-    remove: {
-      scope: ["shoppingCart.remove"],
-      rest: {
-        method: "DELETE",
-        path: "/remove/:id"
-      },
-      cache: false,
-      params: {
-        id: { type: "string" }
-      },
-      async handler(ctx) {
-        const { id } = ctx.params;
-        const clientId = ctx.meta.clientId;
-
-        if (!id || id.trim() === "") {
-          throw new Error("ID is required", 400);
-        }
-
-        const entity = await ctx.call("v1.db.shopping_cart.get", { id, clientId });
-        if (!entity) {
-          throw new Error(`ShoppingCart with id ${id} not found`, 404);
-        }
-
-        await this.deleteRelatedEntities(ctx, entity, clientId);
-        await ctx.call("v1.db.shopping_cart.remove", { id, clientId });
-
-        await ctx.call("v1.tmf663.event-publisher.publish", {
-          eventType: "ShoppingCartDeleteEvent",
-          event: {
-            eventType: "ShoppingCartDeleteEvent",
-            eventTime: new Date().toISOString(),
-            event: {
-              shoppingCart: {
-                id: entity.id,
-                href: entity.href,
-                "@type": "ShoppingCart"
-              }
-            }
-          }
-        });
-
-        return null;
-      }
-    }
-  },
-
-  methods: {
-    async applyJsonPatchQuery(ctx, entity, operations, clientId) {
-      const entityId = entity.id;
-      let workingEntity = JSON.parse(JSON.stringify(entity));
-      
-      for (const operation of operations) {
-        if (!operation.op) {
-          throw new Error("Each operation must have an 'op' field", 400);
-        }
-        if (!['add', 'remove', 'replace'].includes(operation.op)) {
-          throw new Error(`Unsupported operation: ${operation.op}. Supported: add, remove, replace`, 400);
-        }
-        if (!operation.path) {
-          throw new Error("Each operation must have a 'path' field", 400);
-        }
-        if (operation.op !== 'remove' && operation.value === undefined) {
-          throw new Error(`Operation '${operation.op}' requires a 'value' field`, 400);
-        }
-      }
-
-      for (const operation of operations) {
-        workingEntity = await this.applyPatchOperation(ctx, workingEntity, operation, clientId);
-      }
-
-      return workingEntity;
-    },
-
-    async applyPatchOperation(ctx, entity, operation, clientId) {
-      const { op, path, value } = operation;
-      const entityId = entity.id;
-
-      const pathInfo = this.parseJsonPath(path);
-      
-      if (!pathInfo) {
-        throw new Error(`Invalid path format: ${path}`, 400);
-      }
-
-      const { arrayName, filterCondition, targetAttribute, isArrayOperation } = pathInfo;
-
-      if (!isArrayOperation) {
-        return await this.applySimpleOperation(ctx, entity, op, pathInfo.attributeName, value, clientId);
-      }
-
-      const relatedEntityTypes = [
-        'contactMedium', 'cartTotalPrice', 'cartItem', 'relatedParty'
-      ];
-
-      if (!relatedEntityTypes.includes(arrayName)) {
-        throw new Error(`Unknown array: ${arrayName}`, 400);
-      }
-
-      const arrayData = entity[arrayName] || [];
-      
-      const matchingIndices = this.findMatchingElements(arrayData, filterCondition);
-
-      if (matchingIndices.length === 0 && op !== 'add') {
-        throw new Error(`No elements match the filter condition: ${filterCondition}`, 404);
-      }
-
-      switch (op) {
-        case 'add':
-          return await this.handleAddOperation(ctx, entity, arrayName, filterCondition, targetAttribute, value, clientId);
-        
-        case 'remove':
-          return await this.handleRemoveOperation(ctx, entity, arrayName, matchingIndices, targetAttribute, clientId);
-        
-        case 'replace':
-          return await this.handleReplaceOperation(ctx, entity, arrayName, matchingIndices, targetAttribute, value, clientId);
-        
-        default:
-          throw new Error(`Unsupported operation: ${op}`, 400);
-      }
-    },
-
-    parseJsonPath(path) {
-      const arrayIndexRegex = /^\$\.(\w+)\[(\d+)\](?:\.(.+))?$/;
-      let match = path.match(arrayIndexRegex);
-      
-      if (match) {
-        return {
-          isArrayOperation: true,
-          arrayName: match[1],
-          filterCondition: { index: parseInt(match[2], 10) },
-          targetAttribute: match[3] || null
-        };
-      }
-
-      const jsonPathRegex = /^\$\.(\w+)\[\?\(@\.(\w+)==['"](.*)['"]\)\](?:\.(.+))?$/;
-      match = path.match(jsonPathRegex);
-      
-      if (match) {
-        return {
-          isArrayOperation: true,
-          arrayName: match[1],
-          filterCondition: { field: match[2], value: match[3] },
-          targetAttribute: match[4] || null
-        };
-      }
-
-      const complexJsonPathRegex = /^\$\.(\w+)\[\?\(@\.([^=]+)==['"](.*)['"]\)\](?:\.(.+))?$/;
-      match = path.match(complexJsonPathRegex);
-      
-      if (match) {
-        return {
-          isArrayOperation: true,
-          arrayName: match[1],
-          filterCondition: { field: match[2], value: match[3] },
-          targetAttribute: match[4] || null
-        };
-      }
-
-      const multiConditionRegex = /^\$\.(\w+)\[\?\((.+)\)\](?:\.(.+))?$/;
-      match = path.match(multiConditionRegex);
-      
-      if (match) {
-        const conditions = this.parseMultipleConditions(match[2]);
-        return {
-          isArrayOperation: true,
-          arrayName: match[1],
-          filterCondition: conditions,
-          targetAttribute: match[3] || null
-        };
-      }
-
-      const dotNotationRegex = /^\/(\w+)(?:\/(\w+))?\?(.+)$/;
-      match = path.match(dotNotationRegex);
-      
-      if (match) {
-        const conditions = this.parseDotNotationConditions(match[3]);
-        return {
-          isArrayOperation: true,
-          arrayName: match[1],
-          filterCondition: conditions,
-          targetAttribute: match[2] || null
-        };
-      }
-
-      const filterSelectorRegex = /^\?filter=(\w+)\[\?\(@\.(\w+)==['"](.*)['"]\)\](?:\.(.+))?$/;
-      match = path.match(filterSelectorRegex);
-      
-      if (match) {
-        return {
-          isArrayOperation: true,
-          arrayName: match[1],
-          filterCondition: { field: match[2], value: match[3] },
-          targetAttribute: match[4] || null
-        };
-      }
-
-      const nestedAttrRegex = /^\$\.(\w+(?:\.\w+)+)$/;
-      match = path.match(nestedAttrRegex);
-      
-      if (match) {
-        return {
-          isArrayOperation: false,
-          attributeName: match[1],
-          isNested: true
-        };
-      }
-
-      const simpleAttrRegex = /^(?:\/|\$\.)(\w+)$/;
-      match = path.match(simpleAttrRegex);
-      
-      if (match) {
-        return {
-          isArrayOperation: false,
-          attributeName: match[1]
-        };
-      }
-
-      return null;
-    },
-
-    parseMultipleConditions(conditionString) {
-      const conditions = [];
-      const parts = conditionString.split(/\s*&&\s*/);
-      
-      for (const part of parts) {
-        const match = part.match(/@\.([^=]+)==['"](.*)['"]$/);
-        if (match) {
-          conditions.push({ field: match[1].trim(), value: match[2] });
-        }
-      }
-      
-      return conditions.length === 1 ? conditions[0] : conditions;
-    },
-
-    parseDotNotationConditions(conditionString) {
-      const conditions = [];
-      const parts = conditionString.split('&');
-      
-      for (const part of parts) {
-        const [fieldPath, value] = part.split('=');
-        const field = fieldPath.includes('.') 
-          ? fieldPath.split('.').slice(1).join('.')
-          : fieldPath;
-        conditions.push({ field, value });
-      }
-      
-      return conditions.length === 1 ? conditions[0] : conditions;
-    },
-
-    findMatchingElements(array, filterCondition) {
-      if (!Array.isArray(array)) return [];
-      
-      if (filterCondition && typeof filterCondition.index === 'number') {
-        const index = filterCondition.index;
-        if (index >= 0 && index < array.length) {
-          return [index];
-        }
-        return [];
-      }
-      
-      const conditions = Array.isArray(filterCondition) ? filterCondition : [filterCondition];
-      
-      return array.reduce((indices, element, index) => {
-        const matches = conditions.every(condition => {
-          const fieldValue = this.getNestedValue(element, condition.field);
-          return String(fieldValue) === String(condition.value);
-        });
-        
-        if (matches) indices.push(index);
-        return indices;
-      }, []);
-    },
-
-    getNestedValue(obj, path) {
-      if (!obj || !path) return undefined;
-      
-      const parts = path.split('.');
-      let current = obj;
-      
-      for (const part of parts) {
-        if (current === undefined || current === null) return undefined;
-        current = current[part];
-      }
-      
-      return current;
-    },
-
-    setNestedValue(obj, path, value) {
-      const parts = path.split('.');
-      let current = obj;
-      
-      for (let i = 0; i < parts.length - 1; i++) {
-        if (current[parts[i]] === undefined) {
-          current[parts[i]] = {};
-        }
-        current = current[parts[i]];
-      }
-      
-      current[parts[parts.length - 1]] = value;
-    },
-
-    deleteNestedValue(obj, path) {
-      const parts = path.split('.');
-      let current = obj;
-      
-      for (let i = 0; i < parts.length - 1; i++) {
-        if (current[parts[i]] === undefined) {
-          return;
-        }
-        current = current[parts[i]];
-      }
-      
-      delete current[parts[parts.length - 1]];
-    },
-
-    async handleAddOperation(ctx, entity, arrayName, filterCondition, targetAttribute, value, clientId) {
-      const entityId = entity.id;
-      const dbName = this.getDbName(arrayName);
-      const arrayData = entity[arrayName] || [];
-
-      if (targetAttribute) {
-        const matchingIndices = this.findMatchingElements(arrayData, filterCondition);
-        
-        if (matchingIndices.length === 0) {
-          throw new Error(`No elements match the filter condition to add attribute`, 404);
-        }
-
-        for (const index of matchingIndices) {
-          const element = arrayData[index];
-          if (element && element.id) {
-            const existingRecord = await ctx.call(`v1.db.${dbName}.get`, { 
-              id: element.id, 
-              clientId 
-            }).catch(() => null);
-
-            if (existingRecord) {
-              const updateData = { id: element.id, clientId };
-              
-              if (targetAttribute.includes('.')) {
-                const parts = targetAttribute.split('.');
-                const topLevelKey = parts[0];
-                const existingTopLevel = element[topLevelKey] || {};
-                
-                let nestedObj = JSON.parse(JSON.stringify(existingTopLevel));
-                this.setNestedValue({ [topLevelKey]: nestedObj }, targetAttribute, value);
-                
-                updateData[topLevelKey] = nestedObj;
-                
-                await ctx.call(`v1.db.${dbName}.update`, updateData);
-                
-                if (!arrayData[index][topLevelKey]) {
-                  arrayData[index][topLevelKey] = {};
-                }
-                this.setNestedValue(arrayData[index], targetAttribute, value);
-              } else if (typeof value === 'object' && !Array.isArray(value)) {
-                Object.assign(updateData, value);
-                await ctx.call(`v1.db.${dbName}.update`, updateData);
-                arrayData[index][targetAttribute] = { ...arrayData[index][targetAttribute], ...value };
-              } else {
-                updateData[targetAttribute] = value;
-                await ctx.call(`v1.db.${dbName}.update`, updateData);
-                arrayData[index][targetAttribute] = value;
-              }
-            }
-          }
-        }
-      } else {
-        const createMethod = `create${arrayName.charAt(0).toUpperCase() + arrayName.slice(1)}`;
-        
-        if (typeof this[createMethod] === 'function') {
-          const newItems = Array.isArray(value) ? value : [value];
-          const newIds = await this[createMethod](ctx, newItems, entityId, clientId);
-          
-          const existingIds = await ctx.call("v1.db.shopping_cart.get", { id: entityId, clientId })
-            .then(e => e[arrayName] || []);
-          const allIds = [...existingIds, ...newIds];
-          
-          await ctx.call("v1.db.shopping_cart.update", {
-            id: entityId,
-            clientId,
-            [arrayName]: allIds
-          });
-        }
-      }
-
-      entity[arrayName] = arrayData;
-      return entity;
-    },
-
-    async handleRemoveOperation(ctx, entity, arrayName, matchingIndices, targetAttribute, clientId) {
-      const entityId = entity.id;
-      const dbName = this.getDbName(arrayName);
-      const arrayData = entity[arrayName] || [];
-
-      if (targetAttribute) {
-        for (const index of matchingIndices) {
-          const element = arrayData[index];
-          if (element && element.id) {
-            const existingRecord = await ctx.call(`v1.db.${dbName}.get`, { 
-              id: element.id, 
-              clientId 
-            }).catch(() => null);
-
-            if (existingRecord) {
-              if (targetAttribute.includes('.')) {
-                const parts = targetAttribute.split('.');
-                const topLevelKey = parts[0];
-                const existingTopLevel = element[topLevelKey] || {};
-                
-                let nestedObj = JSON.parse(JSON.stringify(existingTopLevel));
-                this.deleteNestedValue(nestedObj, parts.slice(1).join('.'));
-                
-                await ctx.call(`v1.db.${dbName}.update`, {
-                  id: element.id,
-                  clientId,
-                  [topLevelKey]: nestedObj
-                });
-                
-                this.deleteNestedValue(arrayData[index], targetAttribute);
-              } else {
-                await ctx.call(`v1.db.${dbName}.update`, {
-                  id: element.id,
-                  clientId,
-                  [targetAttribute]: null
-                });
-                
-                delete arrayData[index][targetAttribute];
-              }
-            }
-          }
-        }
-      } else {
-        const idsToRemove = matchingIndices.map(i => arrayData[i]?.id).filter(Boolean);
-        
-        for (const relId of idsToRemove) {
-          await ctx.call(`v1.db.${dbName}.remove`, { id: relId, clientId }).catch(() => {});
-        }
-        
-        const existingEntity = await ctx.call("v1.db.shopping_cart.get", { id: entityId, clientId });
-        const remainingIds = (existingEntity[arrayName] || []).filter(id => !idsToRemove.includes(id));
-        
-        await ctx.call("v1.db.shopping_cart.update", {
-          id: entityId,
-          clientId,
-          [arrayName]: remainingIds
-        });
-        
-        entity[arrayName] = arrayData.filter((_, i) => !matchingIndices.includes(i));
-      }
-
-      return entity;
-    },
-
-    async handleReplaceOperation(ctx, entity, arrayName, matchingIndices, targetAttribute, value, clientId) {
-      const entityId = entity.id;
-      const dbName = this.getDbName(arrayName);
-      const arrayData = entity[arrayName] || [];
-
-      if (targetAttribute) {
-        for (const index of matchingIndices) {
-          const element = arrayData[index];
-          if (element && element.id) {
-            const updateData = {
-              id: element.id,
-              clientId
-            };
-            
-            if (targetAttribute.includes('.')) {
-              const parts = targetAttribute.split('.');
-              const topLevelKey = parts[0];
-              const existingTopLevel = element[topLevelKey] || {};
-              
-              let nestedObj = JSON.parse(JSON.stringify(existingTopLevel));
-              this.setNestedValue({ [topLevelKey]: nestedObj }, targetAttribute, value);
-              
-              updateData[topLevelKey] = nestedObj;
-              
-              await ctx.call(`v1.db.${dbName}.update`, updateData);
-              
-              this.setNestedValue(arrayData[index], targetAttribute, value);
-            } else {
-              updateData[targetAttribute] = value;
-              await ctx.call(`v1.db.${dbName}.update`, updateData);
-              arrayData[index][targetAttribute] = value;
-            }
-          }
-        }
-      } else {
-        for (const index of matchingIndices) {
-          const element = arrayData[index];
-          if (element && element.id) {
-            await ctx.call(`v1.db.${dbName}.update`, {
-              id: element.id,
-              clientId,
-              ...value
-            });
-            
-            arrayData[index] = { ...value, id: element.id };
-          }
-        }
-      }
-
-      entity[arrayName] = arrayData;
-      return entity;
-    },
-
-    async applySimpleOperation(ctx, entity, op, attributeName, value, clientId) {
-      const entityId = entity.id;
-      const nonPatchableFields = ["id", "href", "@type"];
-      
-      if (nonPatchableFields.includes(attributeName)) {
-        throw new Error(`Cannot modify field: ${attributeName}`, 400);
-      }
-
-      switch (op) {
-        case 'add':
-        case 'replace':
-          await ctx.call("v1.db.shopping_cart.update", {
-            id: entityId,
-            clientId,
-            [attributeName]: value,
-            lastUpdate: new Date().toISOString()
-          });
-          entity[attributeName] = value;
-          break;
-        
-        case 'remove':
-          await ctx.call("v1.db.shopping_cart.update", {
-            id: entityId,
-            clientId,
-            [attributeName]: null,
-            lastUpdate: new Date().toISOString()
-          });
-          delete entity[attributeName];
-          break;
-      }
-
-      return entity;
-    },
-
-    async applyMergePatch(ctx, existing, updates, clientId) {
-      const entityId = existing.id;
-      
-      this.validatePatchableFields(updates);
-
-      Object.keys(updates).forEach(key => {
-        if (updates[key] === null) {
-          updates[key] = "null";
-        }
-      });
-
-      const relatedEntityTypes = [
-        'contactMedium', 'cartTotalPrice', 'cartItem', 'relatedParty'
-      ];
-
-      for (const relationType of relatedEntityTypes) {
-        if (updates[relationType] && Array.isArray(updates[relationType])) {
-          const existingIds = existing[relationType] || [];
-          const dbName = this.getDbName(relationType);
-          
-          await Promise.all(
-            existingIds.map(relId =>
-              ctx.call(`v1.db.${dbName}.remove`, { id: relId, clientId }).catch(() => {})
-            )
-          );
-
-          const createMethod = `create${relationType.charAt(0).toUpperCase() + relationType.slice(1)}`;
-          if (typeof this[createMethod] === 'function') {
-            const newIds = await this[createMethod](ctx, updates[relationType], entityId, clientId);
-            updates[relationType] = newIds;
-          }
-        }
-      }
-
-      await ctx.call("v1.db.shopping_cart.update", {
-        id: entityId,
-        clientId,
-        ...updates,
-        lastUpdate: new Date().toISOString()
-      });
-
-      return updates;
-    },
-
-    extractChangedAttributesFromOperations(operations) {
-      const attributes = new Set();
-      
-      for (const op of operations) {
-        const pathInfo = this.parseJsonPath(op.path);
-        if (pathInfo) {
-          if (pathInfo.isArrayOperation) {
-            attributes.add(pathInfo.arrayName);
-          } else {
-            attributes.add(pathInfo.attributeName);
-          }
-        }
-      }
-      
-      return Array.from(attributes);
-    },
-
-    getDbName(relationType) {
-      const dbNameMap = {
-        contactMedium: 'contact_medium',
-        cartTotalPrice: 'cart_total_price',
-        cartItem: 'cart_item',
-        relatedParty: 'related_party'
-      };
-      return dbNameMap[relationType] || relationType;
-    },
-
-    async populateShoppingCart(ctx, entity) {
-      const populated = { ...entity };
-      const clientId = ctx.meta.clientId;
-
-      if (entity.contactMedium && entity.contactMedium.length > 0) {
-        const contacts = await Promise.all(
-          entity.contactMedium.map(id =>
-            ctx.call("v1.db.contact_medium.get", { id, clientId }).catch(() => null)
-          )
-        );
-        const contactSchema = ['id', 'preferred', 'contactType', 'validFor', 'emailAddress', 'phoneNumber', 'faxNumber', 'socialNetworkId', 'city', 'country', 'postCode', 'stateOrProvince', 'street1', 'street2', 'geographicAddress', '@type', '@baseType', '@schemaLocation'];
-        populated.contactMedium = contacts.filter(c => c).map(c => this.cleanEntity(c, contactSchema));
-      }
-
-      if (entity.cartTotalPrice && entity.cartTotalPrice.length > 0) {
-        const prices = await Promise.all(
-          entity.cartTotalPrice.map(id =>
-            ctx.call("v1.db.cart_total_price.get", { id, clientId }).catch(() => null)
-          )
-        );
-        const priceSchema = ['id', 'description', 'name', 'priceType', 'recurringChargePeriod', 'unitOfMeasure', 'price', 'priceAlteration', 'productOfferingPrice', '@type', '@baseType', '@schemaLocation'];
-        populated.cartTotalPrice = prices.filter(p => p).map(p => this.cleanEntity(p, priceSchema));
-      }
-
-      if (entity.cartItem && entity.cartItem.length > 0) {
-        const items = await Promise.all(
-          entity.cartItem.map(id =>
-            ctx.call("v1.db.cart_item.get", { id, clientId }).catch(() => null)
-          )
-        );
-        const itemSchema = ['id', 'action', 'quantity', 'status', 'itemTerm', 'cartItem', 'note', 'itemTotalPrice', 'product', 'itemPrice', 'productOffering', 'cartItemRelationship', '@type', '@baseType', '@schemaLocation'];
-        populated.cartItem = items.filter(i => i).map(i => this.cleanEntity(i, itemSchema));
-      }
-
-      if (entity.relatedParty && entity.relatedParty.length > 0) {
-        const parties = await Promise.all(
-          entity.relatedParty.map(id =>
-            ctx.call("v1.db.related_party.get", { id, clientId }).catch(() => null)
-          )
-        );
-        const partySchema = ['id', 'role', 'partyOrPartyRole', '@type', '@baseType', '@schemaLocation'];
-        populated.relatedParty = parties.filter(p => p).map(p => this.cleanEntity(p, partySchema));
-      }
-
-      return populated;
-    },
-
-    async createContactMedium(ctx, items, parentId, clientId) {
-      const ids = [];
-      for (const item of items) {
-        const id = cuid();
-        await ctx.call("v1.db.contact_medium.create", {
-          id,
-          clientId,
-          parentId,
-          ...item,
-          "@type": item["@type"] || "ContactMedium"
-        });
-        ids.push(id);
-      }
-      return ids;
-    },
-
-    async createCartTotalPrice(ctx, items, parentId, clientId) {
-      const ids = [];
-      for (const item of items) {
-        const id = cuid();
-        await ctx.call("v1.db.cart_total_price.create", {
-          id,
-          clientId,
-          parentId,
-          ...item,
-          "@type": item["@type"] || "CartPrice"
-        });
-        ids.push(id);
-      }
-      return ids;
-    },
-
-    async createCartItem(ctx, items, parentId, clientId) {
-      const ids = [];
-      for (const item of items) {
-        const id = cuid();
-        await ctx.call("v1.db.cart_item.create", {
-          id,
-          clientId,
-          parentId,
-          ...item,
-          "@type": item["@type"] || "CartItem"
-        });
-        ids.push(id);
-      }
-      return ids;
-    },
-
-    async createRelatedParty(ctx, items, parentId, clientId) {
-      const ids = [];
-      for (const item of items) {
-        const id = cuid();
-        await ctx.call("v1.db.related_party.create", {
-          id,
-          clientId,
-          parentId,
-          ...item,
-          "@type": item["@type"] || "RelatedPartyOrPartyRole"
-        });
-        ids.push(id);
-      }
-      return ids;
-    },
-
-    async deleteRelatedEntities(ctx, entity, clientId) {
-      const relatedEntityTypes = [
-        { field: 'contactMedium', db: 'contact_medium' },
-        { field: 'cartTotalPrice', db: 'cart_total_price' },
-        { field: 'cartItem', db: 'cart_item' },
-        { field: 'relatedParty', db: 'related_party' }
-      ];
-
-      for (const { field, db } of relatedEntityTypes) {
-        if (entity[field] && entity[field].length > 0) {
-          await Promise.all(
-            entity[field].map(id =>
-              ctx.call(`v1.db.${db}.remove`, { id, clientId }).catch(() => {})
-            )
-          );
-        }
-      }
-    },
-
-    mapToSchema(data) {
-      const schemaFields = [
-        'id', 'href', 'validFor', 'contactMedium', 'cartTotalPrice', 'cartItem',
-        'relatedParty', 'creationDate', 'lastUpdate', '@type', '@baseType', '@schemaLocation'
-      ];
-      const mapped = {};
-
-      if (data.id !== undefined && data.id !== null && data.id !== "null" && data.id !== "") mapped.id = data.id;
-      if (data.href !== undefined && data.href !== null && data.href !== "null" && data.href !== "") mapped.href = data.href;
-
-      schemaFields.forEach(field => {
-        if (field !== 'id' && field !== 'href') {
-          const value = data[field];
-          if (value !== undefined && value !== null && value !== "null" && value !== "" &&
-              !(Array.isArray(value) && value.length === 0)) {
-            mapped[field] = value;
-          }
-        }
-      });
-
-      return mapped;
-    },
-
-    cleanEntity(entity, schemaFields) {
-      if (!entity) return null;
-
-      const cleaned = {};
-
-      if (entity.id !== undefined && entity.id !== null && entity.id !== "null" && entity.id !== "") cleaned.id = entity.id;
-      if (entity.href !== undefined && entity.href !== null && entity.href !== "null" && entity.href !== "") cleaned.href = entity.href;
-
-      schemaFields.forEach(field => {
-        if (field !== 'id' && field !== 'href') {
-          const value = entity[field];
-          if (value !== undefined && value !== null && value !== "null" && value !== "" &&
-              !(Array.isArray(value) && value.length === 0)) {
-            cleaned[field] = value;
-          }
-        }
-      });
-
-      return cleaned;
-    },
-
-    validatePatchableFields(updates) {
-      const nonPatchableFields = ["id", "href", "@type"];
-      const invalidFields = Object.keys(updates).filter(field => nonPatchableFields.includes(field));
-
-      if (invalidFields.length > 0) {
-        throw new Error(`Cannot update non-patchable fields: ${invalidFields.join(", ")}`, 400);
-      }
-    },
-
-    filterFields(obj, fields) {
-      const filtered = {};
-
-      if (obj.id !== undefined && obj.id !== null) filtered.id = obj.id;
-      if (obj.href !== undefined && obj.href !== null) filtered.href = obj.href;
-
-      fields.forEach(field => {
-        if (field !== 'id' && field !== 'href' && obj.hasOwnProperty(field) && obj[field] !== null && obj[field] !== "null") {
-          filtered[field] = obj[field];
-        }
-      });
-
-      if (obj["@type"] !== undefined && obj["@type"] !== null) filtered["@type"] = obj["@type"];
-
-      return filtered;
-    }
-  },
-
-  started() {
-    this.logger.info("ShoppingCart service started");
-  }
+	name: "tmf663.shoppingCart",
+	version: 1,
+
+	settings: {
+		defaultPageSize: 20,
+		maxPageSize: 100,
+		baseUrl: process.env.API_BASE_URL || "http://localhost:3000"
+	},
+
+	dependencies: [],
+
+	actions: {
+		/**
+		 * LIST Action - Retrieve paginated list of shopping carts with search and filtering
+		 */
+		list: {
+			scope: ["shoppingCart.list"],
+			rest: {
+				method: "GET",
+				path: "/list"
+			},
+			cache: false,
+			params: {
+				search: { type: "string", optional: true },
+				fields: { type: "string", optional: true },
+				offset: { type: "number", integer: true, min: 0, default: 0, optional: true, convert: true },
+				limit: { type: "number", integer: true, min: 1, max: 100, default: 20, optional: true, convert: true },
+				sort: { type: "string", optional: true, default: "-createdAt" }
+			},
+			async handler(ctx) {
+				try {
+					const { fields, offset, limit, sort, search, ...filters } = ctx.params;
+					const clientId = ctx.meta.clientId;
+
+					let query = { clientId };
+
+					if (search && search.trim() !== "") {
+						const searchConditions = await this.buildSearchConditions(ctx, search, clientId);
+						if (searchConditions.length > 0) {
+							query.$or = searchConditions;
+						}
+					}
+
+					Object.keys(filters).forEach((key) => {
+						if (filters[key] !== undefined) query[key] = filters[key];
+					});
+
+					const entities = await ctx.call("v1.db.shopping_cart.find", {
+						query,
+						offset,
+						limit,
+						sort
+					});
+
+					const populated = await Promise.all(entities.map((entity) => this.populateShoppingCart(ctx, entity)));
+
+					const total = await ctx.call("v1.db.shopping_cart.count", { query });
+
+					let results = populated.map((entity) => this.mapToSchema(entity));
+
+					if (fields) {
+						const fieldList = fields.split(",").map((f) => f.trim());
+						results = results.map((entity) => this.filterFields(entity, fieldList));
+					}
+
+					const cleanedResults = results.map((result) => this.applyFinalCleanup(result)).filter((r) => r !== undefined);
+
+					return {
+						data: cleanedResults,
+						meta: { total, offset, limit, hasMore: offset + limit < total }
+					};
+				} catch (error) {
+					throw error;
+				}
+			}
+		},
+
+		/**
+		 * CREATE Action - Create new shopping cart with related entities
+		 */
+		create: {
+			scope: ["shoppingCart.create"],
+			rest: {
+				method: "POST",
+				path: "/create"
+			},
+			cache: false,
+			params: {
+				validFor: { type: "object", optional: true },
+				contactMedium: { type: "array", optional: true },
+				cartItem: { type: "array", optional: true },
+				cartTotalPrice: { type: "array", optional: true },
+				relatedParty: { type: "array", optional: true },
+				"@type": { type: "string", optional: true, default: "ShoppingCart" }
+			},
+			async handler(ctx) {
+				const entityData = { ...ctx.params };
+				const clientId = ctx.meta.clientId;
+
+				const id = cuid();
+				entityData.id = id;
+				entityData.clientId = clientId;
+				entityData.creationDate = new Date().toISOString();
+				entityData.lastUpdate = new Date().toISOString();
+
+				if (!entityData["@type"]) entityData["@type"] = "ShoppingCart";
+
+				Object.keys(entityData).forEach((key) => {
+					if (entityData[key] === null) {
+						entityData[key] = "null";
+					}
+				});
+
+				const relatedEntities = {
+					contactMedium: entityData.contactMedium,
+					cartItem: entityData.cartItem,
+					cartTotalPrice: entityData.cartTotalPrice,
+					relatedParty: entityData.relatedParty
+				};
+
+				delete entityData.contactMedium;
+				delete entityData.cartItem;
+				delete entityData.cartTotalPrice;
+				delete entityData.relatedParty;
+
+				let created, entityId;
+
+				try {
+					created = await ctx.call("v1.db.shopping_cart.create", entityData);
+					entityId = created.id;
+
+					created.href = `${this.settings.baseUrl}/api/v1/tmf663/shoppingCart/get/${entityId}`;
+					await ctx.call("v1.db.shopping_cart.update", {
+						id: entityId,
+						clientId,
+						href: created.href
+					});
+				} catch (error) {
+					if (
+						error.message &&
+						(error.message.includes("Unique constraint") ||
+							error.message.includes("SequelizeUniqueConstraintError") ||
+							error.name === "SequelizeUniqueConstraintError")
+					) {
+						const duplicateError = new Error(`ShoppingCart with these details already exists`);
+						duplicateError.code = 409;
+						duplicateError.type = "DUPLICATE_ENTITY_ERROR";
+						throw duplicateError;
+					}
+					throw error;
+				}
+
+				try {
+					for (const [relationType, relatedData] of Object.entries(relatedEntities)) {
+						if (relatedData && relatedData.length > 0) {
+							const ids = await this[`create${this.capitalize(relationType)}`](ctx, relatedData, entityId, clientId);
+							created[relationType] = ids;
+							await ctx.call("v1.db.shopping_cart.update", {
+								id: entityId,
+								clientId,
+								[relationType]: ids
+							});
+						}
+					}
+
+					const populated = await this.populateShoppingCart(ctx, created);
+					const schemaFiltered = this.mapToSchema(populated);
+					const cleanedResponse = this.applyFinalCleanup(schemaFiltered);
+
+					await ctx.call("v1.tmf663.event-publisher.publish", {
+						eventType: "ShoppingCartCreateEvent",
+						event: {
+							eventType: "ShoppingCartCreateEvent",
+							eventTime: new Date().toISOString(),
+							event: { shoppingCart: cleanedResponse }
+						}
+					});
+
+					return cleanedResponse;
+				} catch (error) {
+					await ctx.call("v1.db.shopping_cart.remove", { id: entityId, clientId });
+					throw error;
+				}
+			}
+		},
+
+		/**
+		 * GET Action - Retrieve single shopping cart by ID
+		 */
+		get: {
+			scope: ["shoppingCart.get"],
+			rest: {
+				method: "GET",
+				path: "/get/:id"
+			},
+			cache: false,
+			params: {
+				id: { type: "string" },
+				fields: { type: "string", optional: true }
+			},
+			async handler(ctx) {
+				const { id, fields } = ctx.params;
+				const clientId = ctx.meta.clientId;
+
+				if (!id || id.trim() === "") {
+					throw new Error("ID is required", 400);
+				}
+
+				const entity = await ctx.call("v1.db.shopping_cart.get", { id, clientId });
+				if (!entity) {
+					throw new Error(`ShoppingCart with id ${id} not found`, 404);
+				}
+
+				const populated = await this.populateShoppingCart(ctx, entity);
+
+				let result = this.mapToSchema(populated);
+
+				if (fields) {
+					const fieldList = fields.split(",").map((f) => f.trim());
+					result = this.filterFields(result, fieldList);
+				}
+
+				const version = entity.updatedAt || entity.createdAt;
+				if (version) {
+					ctx.meta.$responseHeaders = {
+						ETag: `"${version}"`,
+						"Cache-Control": "no-cache"
+					};
+				}
+
+				const cleanResult = this.applyFinalCleanup(result);
+
+				return cleanResult;
+			}
+		},
+
+		/**
+		 * PATCH Action - Partial update with dual strategy support
+		 */
+		patch: {
+			scope: ["shoppingCart.patch"],
+			rest: {
+				method: "PATCH",
+				path: "/patch/:id"
+			},
+			cache: false,
+			params: {
+				id: { type: "string" },
+				validFor: { type: "object", optional: true },
+				contactMedium: { type: "array", optional: true },
+				cartItem: { type: "array", optional: true },
+				cartTotalPrice: { type: "array", optional: true },
+				relatedParty: { type: "array", optional: true },
+				$$strict: "remove"
+			},
+			async handler(ctx) {
+				const id = ctx.params.id;
+				const clientId = ctx.meta.clientId;
+
+				if (!id || id.trim() === "") {
+					throw new Error("ID is required", 400);
+				}
+
+				const bodyIsArray = Array.isArray(ctx.meta.$requestBody) || Array.isArray(ctx.meta.$params);
+				const requestBody = ctx.meta.$requestBody || ctx.meta.$params || ctx.params;
+
+				let isJsonPatchQuery = false;
+				if (bodyIsArray) {
+					isJsonPatchQuery = true;
+				} else {
+					const { id: paramId, ...payload } = requestBody;
+					isJsonPatchQuery = payload.op !== undefined;
+				}
+
+				if (isJsonPatchQuery) {
+					const originalParams = ctx.params;
+					ctx.params = bodyIsArray ? requestBody : [requestBody];
+					try {
+						return await this.applyJsonPatchQuery(ctx, id, clientId);
+					} finally {
+						ctx.params = originalParams;
+					}
+				} else {
+					return await this.applyMergeStrategy(ctx, id, clientId);
+				}
+			}
+		},
+
+		/**
+		 * REMOVE Action - Delete shopping cart and all related entities
+		 */
+		remove: {
+			scope: ["shoppingCart.remove"],
+			rest: {
+				method: "DELETE",
+				path: "/remove/:id"
+			},
+			cache: false,
+			params: {
+				id: { type: "string" }
+			},
+			async handler(ctx) {
+				const { id } = ctx.params;
+				const clientId = ctx.meta.clientId;
+
+				if (!id || id.trim() === "") {
+					throw new Error("ID is required", 400);
+				}
+
+				const entity = await ctx.call("v1.db.shopping_cart.get", { id, clientId });
+				if (!entity) {
+					throw new Error(`ShoppingCart with id ${id} not found`, 404);
+				}
+
+				await this.deleteRelatedEntities(ctx, entity, clientId);
+				await ctx.call("v1.db.shopping_cart.remove", { id, clientId });
+
+				await ctx.call("v1.tmf663.event-publisher.publish", {
+					eventType: "ShoppingCartDeleteEvent",
+					event: {
+						eventType: "ShoppingCartDeleteEvent",
+						eventTime: new Date().toISOString(),
+						event: {
+							shoppingCart: {
+								id: entity.id,
+								href: entity.href,
+								"@type": "ShoppingCart"
+							}
+						}
+					}
+				});
+
+				return null;
+			}
+		}
+	},
+
+	methods: {
+		/**
+		 * Build search conditions for text search across multiple fields
+		 */
+		async buildSearchConditions(ctx, searchTerm, clientId) {
+			if (!searchTerm || searchTerm.trim() === "") {
+				return [];
+			}
+
+			const search = searchTerm.trim();
+			const searchConditions = [];
+
+			try {
+				const matchingContacts = await ctx.call("v1.db.contact_medium.find", {
+					query: {
+						clientId,
+						$or: [{ emailAddress: { $iLike: `%${search}%` } }, { phoneNumber: { $iLike: `%${search}%` } }]
+					},
+					fields: ["id"]
+				});
+
+				if (matchingContacts && matchingContacts.length > 0) {
+					matchingContacts.forEach((contact) => {
+						searchConditions.push({ contactMedium: { $contains: [contact.id] } });
+					});
+				}
+			} catch (error) {
+				this.logger.warn("Contact medium search error:", error);
+			}
+
+			return searchConditions;
+		},
+
+		/**
+		 * Populate related entities by fetching them from their respective database tables
+		 */
+		async populateShoppingCart(ctx, entity) {
+			const populated = { ...entity };
+
+			const relatedArrayFields = ["contactMedium", "cartItem", "cartTotalPrice", "relatedParty"];
+
+			for (const field of relatedArrayFields) {
+				if (populated[field] && Array.isArray(populated[field])) {
+					const dbField = field.replace(/([A-Z])/g, "_$1").toLowerCase();
+					const results = await Promise.all(
+						populated[field].map((id) => ctx.call(`v1.db.${dbField}.get`, { id, clientId: ctx.meta.clientId }).catch(() => null))
+					);
+					populated[field] = results.filter((r) => r !== null).map((item) => this.removeNullFields(item));
+				}
+			}
+
+			return populated;
+		},
+
+		/**
+		 * Recursively remove null, undefined, "null" string values, and database internal fields
+		 */
+		removeNullFields(obj) {
+			const internalFields = ["clientId", "createdAt", "updatedAt", "deletedAt", "deletedBy", "createdBy", "updatedBy"];
+
+			if (obj === null || obj === undefined || obj === "null") {
+				return undefined;
+			}
+
+			if (Array.isArray(obj)) {
+				const cleaned = obj.map((item) => this.removeNullFields(item)).filter((item) => item !== undefined && item !== null);
+				return cleaned.length > 0 ? cleaned : undefined;
+			}
+
+			if (typeof obj === "object") {
+				const cleaned = {};
+				for (const key in obj) {
+					if (obj.hasOwnProperty(key)) {
+						if (internalFields.includes(key)) {
+							continue;
+						}
+
+						const value = obj[key];
+
+						if (value === null || value === undefined || value === "null") {
+							continue;
+						}
+
+						const cleanedValue = this.removeNullFields(value);
+
+						if (cleanedValue !== undefined) {
+							cleaned[key] = cleanedValue;
+						}
+					}
+				}
+
+				return Object.keys(cleaned).length > 0 ? cleaned : undefined;
+			}
+
+			return obj;
+		},
+
+		/**
+		 * Apply final cleanup to response
+		 */
+		applyFinalCleanup(response) {
+			return this.removeNullFields(response);
+		},
+
+		/**
+		 * Related Entity Creation Methods
+		 */
+		async createContactMedium(ctx, entities, parentId, clientId) {
+			const ids = [];
+			for (const entity of entities) {
+				const id = cuid();
+				const created = await ctx.call("v1.db.contact_medium.create", {
+					id,
+					clientId,
+					...entity,
+					"@type": entity["@type"] || "ContactMedium"
+				});
+				ids.push(created.id);
+			}
+			return ids;
+		},
+
+		async createCartItem(ctx, entities, parentId, clientId) {
+			const ids = [];
+			for (const entity of entities) {
+				const id = cuid();
+				const created = await ctx.call("v1.db.cart_item.create", {
+					id,
+					clientId,
+					...entity,
+					"@type": entity["@type"] || "CartItem"
+				});
+				ids.push(created.id);
+			}
+			return ids;
+		},
+
+		async createCartTotalPrice(ctx, entities, parentId, clientId) {
+			const ids = [];
+			for (const entity of entities) {
+				const id = cuid();
+				const created = await ctx.call("v1.db.cart_total_price.create", {
+					id,
+					clientId,
+					...entity,
+					"@type": entity["@type"] || "CartPrice"
+				});
+				ids.push(created.id);
+			}
+			return ids;
+		},
+
+		async createRelatedParty(ctx, entities, parentId, clientId) {
+			const ids = [];
+			for (const entity of entities) {
+				const id = cuid();
+				const created = await ctx.call("v1.db.related_party.create", {
+					id,
+					clientId,
+					...entity,
+					"@type": entity["@type"] || "RelatedPartyOrPartyRole"
+				});
+				ids.push(created.id);
+			}
+			return ids;
+		},
+
+		/**
+		 * Merge related entities during PATCH operations
+		 */
+		async mergeRelatedEntities(ctx, relationType, existingIds, updatePayload, parentId, clientId) {
+			const dbField = relationType.replace(/([A-Z])/g, "_$1").toLowerCase();
+
+			const existingEntities = await Promise.all(existingIds.map((id) => ctx.call(`v1.db.${dbField}.get`, { id, clientId }).catch(() => null)));
+			const validExisting = existingEntities.filter((e) => e !== null);
+
+			const updatedIds = [];
+			const processedIds = new Set();
+
+			for (const item of updatePayload) {
+				if (item.id && existingIds.includes(item.id)) {
+					await ctx.call(`v1.db.${dbField}.update`, {
+						id: item.id,
+						clientId,
+						...item
+					});
+					updatedIds.push(item.id);
+					processedIds.add(item.id);
+				} else {
+					const newId = cuid();
+					const created = await this[`create${this.capitalize(relationType)}`](ctx, [{ ...item, id: newId }], parentId, clientId);
+					updatedIds.push(...created);
+					processedIds.add(newId);
+				}
+			}
+
+			for (const existingEntity of validExisting) {
+				if (!processedIds.has(existingEntity.id)) {
+					updatedIds.push(existingEntity.id);
+				}
+			}
+
+			return updatedIds;
+		},
+
+		/**
+		 * Delete all related entities during entity deletion
+		 */
+		async deleteRelatedEntities(ctx, entity, clientId) {
+			const relatedEntityTypes = ["contactMedium", "cartItem", "cartTotalPrice", "relatedParty"];
+
+			for (const relationType of relatedEntityTypes) {
+				if (entity[relationType] && Array.isArray(entity[relationType])) {
+					const dbField = relationType.replace(/([A-Z])/g, "_$1").toLowerCase();
+					await Promise.all(entity[relationType].map((id) => ctx.call(`v1.db.${dbField}.remove`, { id, clientId }).catch(() => {})));
+				}
+			}
+		},
+
+		/**
+		 * Map database entity to TMF API schema
+		 */
+		mapToSchema(data) {
+			const schemaFields = [
+				"id",
+				"href",
+				"validFor",
+				"contactMedium",
+				"cartItem",
+				"cartTotalPrice",
+				"relatedParty",
+				"creationDate",
+				"lastUpdate",
+				"@type",
+				"@baseType",
+				"@schemaLocation"
+			];
+
+			const mapped = {};
+
+			if (data.id !== undefined && data.id !== null && data.id !== "null") mapped.id = data.id;
+			if (data.href !== undefined && data.href !== null && data.href !== "null") mapped.href = data.href;
+
+			schemaFields.forEach((field) => {
+				if (field !== "id" && field !== "href" && data[field] !== undefined && data[field] !== null && data[field] !== "null") {
+					const cleanedValue = this.removeNullFields(data[field]);
+					if (cleanedValue !== undefined) {
+						mapped[field] = cleanedValue;
+					}
+				}
+			});
+
+			return mapped;
+		},
+
+		/**
+		 * Validate that fields are patchable (not read-only)
+		 */
+		validatePatchableFields(updates) {
+			const nonPatchableFields = ["id", "href", "@type", "creationDate"];
+			const invalidFields = Object.keys(updates).filter((field) => nonPatchableFields.includes(field));
+
+			if (invalidFields.length > 0) {
+				throw new Error(`Cannot update non-patchable fields: ${invalidFields.join(", ")}`, 400);
+			}
+		},
+
+		/**
+		 * Filter response to only requested fields
+		 */
+		filterFields(obj, fields) {
+			const filtered = {};
+
+			if (obj.id !== undefined && obj.id !== null) filtered.id = obj.id;
+			if (obj.href !== undefined && obj.href !== null) filtered.href = obj.href;
+
+			fields.forEach((field) => {
+				if (field !== "id" && field !== "href" && obj.hasOwnProperty(field) && obj[field] !== null && obj[field] !== "null") {
+					filtered[field] = obj[field];
+				}
+			});
+
+			if (obj["@type"] !== undefined && obj["@type"] !== null) filtered["@type"] = obj["@type"];
+
+			return filtered;
+		},
+
+		capitalize(str) {
+			return str.charAt(0).toUpperCase() + str.slice(1);
+		},
+
+		/**
+		 * Apply JSON Patch Query operations (TMF630)
+		 */
+		async applyJsonPatchQuery(ctx, id, clientId) {
+			const operations = ctx.params;
+
+			if (!Array.isArray(operations)) {
+				throw new Error("JSON Patch Query request body must be an array of operations", 400);
+			}
+
+			JsonPatchQueryHelper.validateOperations(operations);
+
+			const existing = await ctx.call("v1.db.shopping_cart.get", { id, clientId });
+			if (!existing) {
+				throw new Error(`ShoppingCart with id ${id} not found`, 404);
+			}
+
+			await this.checkOptimisticLocking(ctx, existing);
+
+			const changedAttributes = new Set();
+
+			for (const operation of operations) {
+				const result = await this.applyPatchOperation(ctx, id, clientId, existing, operation);
+				if (result.changedAttribute) {
+					changedAttributes.add(result.changedAttribute);
+				}
+			}
+
+			await ctx.call("v1.db.shopping_cart.update", {
+				id,
+				clientId,
+				lastUpdate: new Date().toISOString(),
+				updatedAt: new Date().toISOString()
+			});
+
+			const updated = await ctx.call("v1.db.shopping_cart.get", { id, clientId });
+			const populated = await this.populateShoppingCart(ctx, updated);
+			const schemaFiltered = this.mapToSchema(populated);
+			const cleanedResponse = this.applyFinalCleanup(schemaFiltered);
+
+			await ctx.call("v1.tmf663.event-publisher.publish", {
+				eventType: "ShoppingCartAttributeValueChangeEvent",
+				event: {
+					eventType: "ShoppingCartAttributeValueChangeEvent",
+					eventTime: new Date().toISOString(),
+					event: {
+						shoppingCart: cleanedResponse,
+						changedAttributes: Array.from(changedAttributes)
+					}
+				}
+			});
+
+			return cleanedResponse;
+		},
+
+		/**
+		 * Apply legacy merge strategy (backward compatible)
+		 */
+		async applyMergeStrategy(ctx, id, clientId) {
+			const { id: paramId, ...updates } = ctx.params;
+
+			this.validatePatchableFields(updates);
+
+			const existing = await ctx.call("v1.db.shopping_cart.get", { id, clientId });
+			if (!existing) {
+				throw new Error(`ShoppingCart with id ${id} not found`, 404);
+			}
+
+			await this.checkOptimisticLocking(ctx, existing);
+
+			Object.keys(updates).forEach((key) => {
+				if (updates[key] === null) {
+					updates[key] = "null";
+				}
+			});
+
+			const changedAttributes = [];
+			const relatedEntityTypes = ["contactMedium", "cartItem", "cartTotalPrice", "relatedParty"];
+
+			for (const relationType of relatedEntityTypes) {
+				if (updates[relationType] && Array.isArray(updates[relationType])) {
+					const mergedIds = await this.mergeRelatedEntities(
+						ctx,
+						relationType,
+						existing[relationType] || [],
+						updates[relationType],
+						id,
+						clientId
+					);
+
+					updates[relationType] = mergedIds;
+					changedAttributes.push(relationType);
+				}
+			}
+
+			const updated = await ctx.call("v1.db.shopping_cart.update", {
+				id,
+				clientId,
+				...updates,
+				lastUpdate: new Date().toISOString(),
+				updatedAt: new Date().toISOString()
+			});
+
+			const populated = await this.populateShoppingCart(ctx, updated);
+			const schemaFiltered = this.mapToSchema(populated);
+			const cleanedResponse = this.applyFinalCleanup(schemaFiltered);
+
+			await ctx.call("v1.tmf663.event-publisher.publish", {
+				eventType: "ShoppingCartAttributeValueChangeEvent",
+				event: {
+					eventType: "ShoppingCartAttributeValueChangeEvent",
+					eventTime: new Date().toISOString(),
+					event: { shoppingCart: cleanedResponse, changedAttributes }
+				}
+			});
+
+			return cleanedResponse;
+		},
+
+		/**
+		 * Check optimistic locking with If-Match header
+		 */
+		async checkOptimisticLocking(ctx, existing) {
+			const ifMatch = ctx.meta.headers && (ctx.meta.headers["if-match"] || ctx.meta.headers["If-Match"]);
+			if (ifMatch) {
+				const currentVersion = existing.updatedAt || existing.createdAt;
+				const requestedVersion = ifMatch.replace(/^["']|["']$/g, "");
+
+				if (currentVersion !== requestedVersion) {
+					const error = new Error("Precondition Failed: Resource has been modified by another request");
+					error.code = 412;
+					error.type = "PRECONDITION_FAILED";
+					error.data = {
+						current: currentVersion,
+						requested: requestedVersion,
+						message: "The resource has been modified since you last retrieved it. Please fetch the latest version and retry."
+					};
+					throw error;
+				}
+			}
+		},
+
+		/**
+		 * Apply a single JSON Patch operation
+		 */
+		async applyPatchOperation(ctx, entityId, clientId, existing, operation) {
+			const { op, path, value } = operation;
+			const pathInfo = JsonPatchQueryHelper.parsePath(path);
+
+			if (pathInfo.isSimpleField) {
+				return await this.applySimpleFieldOperation(ctx, entityId, clientId, operation);
+			}
+
+			const { arrayName, filter, attribute, isIndexBased, index } = pathInfo;
+			const relatedEntityTypes = ["contactMedium", "cartItem", "cartTotalPrice", "relatedParty"];
+
+			if (!relatedEntityTypes.includes(arrayName)) {
+				throw new Error(
+					`Invalid array field '${arrayName}'. Field does not exist in ShoppingCart schema. Valid array fields are: ${relatedEntityTypes.join(", ")}`,
+					400
+				);
+			}
+
+			switch (op) {
+				case "add":
+					return await this.applyAddOperation(ctx, entityId, clientId, existing, arrayName, filter, attribute, value, isIndexBased ? index : null);
+				case "remove":
+					return await this.applyRemoveOperation(ctx, entityId, clientId, existing, arrayName, filter, attribute, isIndexBased ? index : null);
+				case "replace":
+					return await this.applyReplaceOperation(ctx, entityId, clientId, existing, arrayName, filter, attribute, value, isIndexBased ? index : null);
+				default:
+					throw new Error(`Unsupported operation: ${op}`, 501);
+			}
+		},
+
+		/**
+		 * Apply operation on simple field (non-array)
+		 */
+		async applySimpleFieldOperation(ctx, entityId, clientId, operation) {
+			const { op, path, value } = operation;
+			const fieldName = path.replace(/^\$\./, "").replace(/^\//, "");
+
+			const validSimpleFields = ["validFor"];
+
+			if (!validSimpleFields.includes(fieldName)) {
+				throw new Error(
+					`Invalid field '${fieldName}'. Field does not exist in ShoppingCart schema or is read-only. Valid patchable fields are: ${validSimpleFields.join(", ")}`,
+					400
+				);
+			}
+
+			const updates = {};
+
+			if (op === "replace" || op === "add") {
+				updates[fieldName] = value;
+			} else if (op === "remove") {
+				updates[fieldName] = null;
+			}
+
+			await ctx.call("v1.db.shopping_cart.update", {
+				id: entityId,
+				clientId,
+				...updates
+			});
+
+			return { changedAttribute: fieldName };
+		},
+
+		/**
+		 * Apply ADD operation on array
+		 */
+		async applyAddOperation(ctx, entityId, clientId, existing, arrayName, filter, attribute, value, targetIndex = null) {
+			const dbField = JsonPatchQueryHelper.toSnakeCase(arrayName);
+			const currentIds = existing[arrayName] || [];
+
+			if (!filter) {
+				const newId = cuid();
+				const entityData = typeof value === "object" ? value : { [attribute]: value };
+				await this[`create${this.capitalize(arrayName)}`](ctx, [{ ...entityData, id: newId }], entityId, clientId);
+
+				const updatedIds = [...currentIds, newId];
+				await ctx.call("v1.db.shopping_cart.update", {
+					id: entityId,
+					clientId,
+					[arrayName]: updatedIds
+				});
+			} else {
+				const currentEntities = await Promise.all(
+					currentIds.map((id) => ctx.call(`v1.db.${dbField}.get`, { id, clientId }).catch(() => null))
+				);
+
+				const matches = JsonPatchQueryHelper.findMatchingElements(
+					currentEntities.filter((e) => e !== null),
+					filter,
+					targetIndex
+				);
+
+				if (matches.length === 0) {
+					throw new Error(`No matching element found for filter: ${filter}`, 404);
+				}
+
+				for (const match of matches) {
+					const updates = this.buildNestedUpdateWithMerge(match.element, attribute, value);
+					await ctx.call(`v1.db.${dbField}.update`, {
+						id: match.element.id,
+						clientId,
+						...updates
+					});
+				}
+			}
+
+			return { changedAttribute: arrayName };
+		},
+
+		/**
+		 * Apply REMOVE operation on array
+		 */
+		async applyRemoveOperation(ctx, entityId, clientId, existing, arrayName, filter, attribute, targetIndex = null) {
+			const dbField = JsonPatchQueryHelper.toSnakeCase(arrayName);
+			const currentIds = existing[arrayName] || [];
+
+			const currentEntities = await Promise.all(currentIds.map((id) => ctx.call(`v1.db.${dbField}.get`, { id, clientId }).catch(() => null)));
+
+			const matches = JsonPatchQueryHelper.findMatchingElements(
+				currentEntities.filter((e) => e !== null),
+				filter,
+				targetIndex
+			);
+
+			if (matches.length === 0) {
+				throw new Error(`No matching element found for filter: ${filter}`, 404);
+			}
+
+			if (!attribute) {
+				const idsToRemove = matches.map((m) => m.element.id);
+
+				for (const idToRemove of idsToRemove) {
+					await ctx.call(`v1.db.${dbField}.remove`, { id: idToRemove, clientId }).catch(() => {});
+				}
+
+				const updatedIds = currentIds.filter((id) => !idsToRemove.includes(id));
+				await ctx.call("v1.db.shopping_cart.update", {
+					id: entityId,
+					clientId,
+					[arrayName]: updatedIds
+				});
+			} else {
+				for (const match of matches) {
+					const updates = this.buildNestedUpdateWithMerge(match.element, attribute, null);
+					await ctx.call(`v1.db.${dbField}.update`, {
+						id: match.element.id,
+						clientId,
+						...updates
+					});
+				}
+			}
+
+			return { changedAttribute: arrayName };
+		},
+
+		/**
+		 * Apply REPLACE operation on array
+		 */
+		async applyReplaceOperation(ctx, entityId, clientId, existing, arrayName, filter, attribute, value, targetIndex = null) {
+			const dbField = JsonPatchQueryHelper.toSnakeCase(arrayName);
+			const currentIds = existing[arrayName] || [];
+
+			const currentEntities = await Promise.all(currentIds.map((id) => ctx.call(`v1.db.${dbField}.get`, { id, clientId }).catch(() => null)));
+
+			const matches = JsonPatchQueryHelper.findMatchingElements(
+				currentEntities.filter((e) => e !== null),
+				filter,
+				targetIndex
+			);
+
+			if (matches.length === 0) {
+				throw new Error(`No matching element found for filter: ${filter}`, 404);
+			}
+
+			for (const match of matches) {
+				if (!attribute) {
+					await ctx.call(`v1.db.${dbField}.update`, {
+						id: match.element.id,
+						clientId,
+						...value
+					});
+				} else {
+					const updates = this.buildNestedUpdateWithMerge(match.element, attribute, value);
+					await ctx.call(`v1.db.${dbField}.update`, {
+						id: match.element.id,
+						clientId,
+						...updates
+					});
+				}
+			}
+
+			return { changedAttribute: arrayName };
+		},
+
+		/**
+		 * Build nested update object with merge (TMF630 compliant)
+		 */
+		buildNestedUpdateWithMerge(existingEntity, path, value) {
+			if (!path || !path.includes(".")) {
+				return typeof value === "object" ? value : { [path]: value };
+			}
+
+			const parts = path.split(".");
+			const topLevelKey = parts[0];
+
+			const existingTopLevel = existingEntity[topLevelKey] || {};
+			const merged = JSON.parse(JSON.stringify(existingTopLevel));
+
+			let current = merged;
+			for (let i = 1; i < parts.length - 1; i++) {
+				if (!current[parts[i]]) {
+					current[parts[i]] = {};
+				}
+				current = current[parts[i]];
+			}
+
+			const targetField = parts[parts.length - 1];
+			if (value === null) {
+				delete current[targetField];
+			} else {
+				current[targetField] = value;
+			}
+
+			return { [topLevelKey]: merged };
+		}
+	},
+
+	started() {
+		this.logger.info("TMF663 Shopping Cart service started");
+	}
 };
